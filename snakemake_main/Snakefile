@@ -1,0 +1,250 @@
+configfile: "config.yaml"
+
+import os
+import csv
+
+# --- Helper Functions ---
+def get_data_path(filename):
+    return os.path.join(config["paths"]["base_dir"], config["paths"]["data_dir"], filename)
+
+def get_genome_path():
+    return os.path.join(config["paths"]["base_dir"], config["paths"]["genome_dir"])
+
+# --- Load Adapters ---
+adapters = {}
+# Assuming sequences_file is in the base dir or use absolute path
+seq_file = config["params"].get("sequences_file", "read_sequences.csv")
+try:
+    with open(seq_file) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            adapters[row["sample_id"]] = {
+                "g": row["forward_read"],
+                "G": row["reverse_read"]
+            }
+except FileNotFoundError:
+    raise FileNotFoundError(f"Could not open sequences file: {seq_file}")
+
+def get_adapter_g(wildcards):
+    # Extract ID "1" from "1_male_..."
+    sid = wildcards.sample.split('_')[0]
+    if sid not in adapters:
+        raise ValueError(f"Sample ID '{sid}' (from {wildcards.sample}) not found in {seq_file}")
+
+    seq = adapters[sid]['g']
+    if not seq or seq == "NA":
+        raise ValueError(f"Forward adapter is '{seq}' for sample {wildcards.sample}. Cannot run Cutadapt.")
+    return seq
+
+def get_adapter_G(wildcards):
+    sid = wildcards.sample.split('_')[0]
+    if sid not in adapters:
+         raise ValueError(f"Sample ID '{sid}' not found in {seq_file}")
+
+    seq = adapters[sid]['G']
+    if not seq or seq == "NA":
+        raise ValueError(f"Reverse adapter is '{seq}' for sample {wildcards.sample}. Cannot run Cutadapt.")
+    return seq
+
+# --- Target Rule ---
+rule all:
+    input:
+        "results/qc_multiqc/multiqc_report.html",
+        expand("results/deduplicated/{sample}_deduplicated.sorted.bam.bai", sample=config["samples"]),
+        expand("results/methylation/{sample}_deduplicated.deduplicated.CX_report.txt.gz", sample=config["samples"])
+
+# --- Step 1: Raw QC ---
+rule raw_fastqc:
+    input:
+        r1 = lambda wildcards: get_data_path(f"{wildcards.sample}_R1.fastq.gz"),
+        r2 = lambda wildcards: get_data_path(f"{wildcards.sample}_R2.fastq.gz")
+    output:
+        html_r1 = "results/qc_raw/{sample}_R1_fastqc.html",
+        zip_r1  = "results/qc_raw/{sample}_R1_fastqc.zip",
+        html_r2 = "results/qc_raw/{sample}_R2_fastqc.html",
+        zip_r2  = "results/qc_raw/{sample}_R2_fastqc.zip"
+    log: "logs/qc_raw/{sample}.log"
+    threads: 4
+    singularity: config["containers"]["trimgalore"]
+    shell:
+        """
+        fastqc --threads {threads} --outdir results/qc_raw {input.r1} {input.r2} > {log} 2>&1
+        """
+
+# --- Step 2a: Manual Cutadapt ---
+# Note: You are running cutadapt manually before Trim Galore.
+rule manual_cutadapt:
+    input:
+        r1 = lambda wildcards: get_data_path(f"{wildcards.sample}_R1.fastq.gz"),
+        r2 = lambda wildcards: get_data_path(f"{wildcards.sample}_R2.fastq.gz")
+    output:
+        r1 = "results/trimmed/intermediate/{sample}_R1_trimmed.fastq.gz",
+        r2 = "results/trimmed/intermediate/{sample}_R2_trimmed.fastq.gz"
+    params:
+        g_adapt = get_adapter_g,
+        G_adapt = get_adapter_G
+    log: "logs/cutadapt/{sample}.log"
+    threads: 4
+    singularity: config["containers"]["trimgalore"]
+    shell:
+        """
+        cutadapt -j {threads} \
+        -g {params.g_adapt} -G {params.G_adapt} \
+        -o {output.r1} -p {output.r2} \
+        {input.r1} {input.r2} > {log} 2>&1
+        """
+
+# --- Step 2b: Trim Galore ---
+rule trim_galore:
+    input:
+        r1 = "results/trimmed/intermediate/{sample}_R1_trimmed.fastq.gz",
+        r2 = "results/trimmed/intermediate/{sample}_R2_trimmed.fastq.gz"
+    output:
+        r1 = "results/trimmed/{sample}_R1_trimmed_val_1.fq.gz",
+        r2 = "results/trimmed/{sample}_R2_trimmed_val_2.fq.gz",
+        rep1 = "results/trimmed/{sample}_R1_trimmed.fastq.gz_trimming_report.txt",
+        rep2 = "results/trimmed/{sample}_R2_trimmed.fastq.gz_trimming_report.txt"
+    params:
+        outdir = "results/trimmed",
+        c_r1 = config["params"]["clip_r1"],
+        c_r2 = config["params"]["clip_r2"],
+        tpc_r1 = config["params"]["three_prime_clip_r1"],
+        tpc_r2 = config["params"]["three_prime_clip_r2"]
+    log: "logs/trim_galore/{sample}.log"
+    threads: 4
+    singularity: config["containers"]["trimgalore"]
+    shell:
+        """
+        trim_galore --paired --quality 20 --length 30 \
+        --clip_R1 {params.c_r1} --clip_R2 {params.c_r2} \
+        --three_prime_clip_R1 {params.tpc_r1} --three_prime_clip_R2 {params.tpc_r2} \
+        --cores {threads} --output_dir {params.outdir} \
+        {input.r1} {input.r2} > {log} 2>&1
+        """
+
+# --- Step 2c: QC on Trimmed Reads (Requested in comments) ---
+rule trimmed_fastqc:
+    input:
+        r1 = "results/trimmed/{sample}_R1_trimmed_val_1.fq.gz",
+        r2 = "results/trimmed/{sample}_R2_trimmed_val_2.fq.gz"
+    output:
+        html_r1 = "results/qc_trimmed/{sample}_R1_trimmed_val_1_fastqc.html",
+        zip_r1  = "results/qc_trimmed/{sample}_R1_trimmed_val_1_fastqc.zip",
+        html_r2 = "results/qc_trimmed/{sample}_R2_trimmed_val_2_fastqc.html",
+        zip_r2  = "results/qc_trimmed/{sample}_R2_trimmed_val_2_fastqc.zip"
+    log: "logs/qc_trimmed/{sample}.log"
+    threads: 4
+    singularity: config["containers"]["trimgalore"]
+    shell:
+        """
+        (
+        mkdir -p results/qc_trimmed
+        fastqc --threads {threads} --outdir results/qc_trimmed {input.r1} {input.r2}
+        ) > {log} 2>&1
+        """
+
+# --- Step 3: Bismark Alignment ---
+rule bismark_align:
+    input:
+        r1 = "results/trimmed/{sample}_R1_trimmed_val_1.fq.gz",
+        r2 = "results/trimmed/{sample}_R2_trimmed_val_2.fq.gz",
+        genome = get_genome_path()
+    output:
+        bam = "results/aligned/{sample}_R1_trimmed_val_1_bismark_bt2_pe.bam",
+        report = "results/aligned/{sample}_R1_trimmed_val_1_bismark_bt2_PE_report.txt"
+    log: "logs/aligned/{sample}.log"
+    threads: 4
+    # Note: Bismark often requires high memory. Adjust resources in cluster config.
+    resources:
+        mem_mb = 32000
+    singularity: config["containers"]["bismark"]
+    shell:
+        """
+        bismark --genome {input.genome} \
+        -1 {input.r1} -2 {input.r2} \
+        --output_dir results/aligned \
+        --un --ambiguous \
+        --parallel {threads} \
+        --score_min L,0,-0.6 > {log} 2>&1
+        """
+
+# --- Step 4: Deduplication ---
+rule deduplication:
+    input:
+        bam = "results/aligned/{sample}_R1_trimmed_val_1_bismark_bt2_pe.bam"
+    output:
+        bam = "results/deduplicated/{sample}_deduplicated.deduplicated.bam",
+        report = "results/deduplicated/{sample}_deduplicated.deduplication_report.txt"
+    params:
+        basename = "{sample}_deduplicated"
+    log: "logs/deduplicated/{sample}.log"
+    # Deduplication can be memory intensive
+    resources:
+        mem_mb = 16000
+    singularity: config["containers"]["bismark"]
+    shell:
+        """
+        deduplicate_bismark --bam --paired \
+        -o {params.basename} \
+        --output_dir results/deduplicated \
+        {input.bam} > {log} 2>&1
+        """
+
+# --- Step 5: Methylation Extraction ---
+rule methylation_extraction:
+    input:
+        bam = "results/deduplicated/{sample}_deduplicated.deduplicated.bam",
+        genome = get_genome_path()
+    output:
+        mbias = "results/methylation/{sample}_deduplicated.deduplicated.M-bias.txt",
+        cytosine_report = "results/methylation/{sample}_deduplicated.deduplicated.CX_report.txt.gz",
+        coverage = "results/methylation/{sample}_deduplicated.deduplicated.bismark.cov.gz"
+    params:
+        outdir = "results/methylation"
+    log: "logs/methylation/{sample}.log"
+    singularity: config["containers"]["bismark"]
+    shell:
+        """
+        bismark_methylation_extractor -p \
+        --gzip --bedGraph --CX --cytosine_report \
+        --genome_folder {input.genome} \
+        --output {params.outdir} \
+        {input.bam} > {log} 2>&1
+        """
+
+# --- Step 6: Final Sorting ---
+rule sort_index_bam:
+    input:
+        bam = "results/deduplicated/{sample}_deduplicated.deduplicated.bam"
+    output:
+        bam = "results/deduplicated/{sample}_deduplicated.sorted.bam",
+        bai = "results/deduplicated/{sample}_deduplicated.sorted.bam.bai"
+    log: "logs/deduplicated/{sample}_sort_index.log"
+    threads: 4
+    singularity: config["containers"]["bismark"]
+    shell:
+        """
+        (
+        samtools sort -@ {threads} -o {output.bam} {input.bam}
+        samtools index {output.bam} {output.bai}
+        ) > {log} 2>&1
+        """
+
+# --- Step 7: MultiQC ---
+rule multiqc:
+    input:
+        # Gather all reports from all samples
+        expand("results/qc_raw/{sample}_R1_fastqc.zip", sample=config["samples"]),
+        expand("results/trimmed/{sample}_R1_trimmed.fastq.gz_trimming_report.txt", sample=config["samples"]),
+        expand("results/qc_trimmed/{sample}_R1_trimmed_val_1_fastqc.zip", sample=config["samples"]),
+        expand("results/aligned/{sample}_R1_trimmed_val_1_bismark_bt2_PE_report.txt", sample=config["samples"]),
+        expand("results/deduplicated/{sample}_deduplicated.deduplication_report.txt", sample=config["samples"]),
+        expand("results/methylation/{sample}_deduplicated.deduplicated.M-bias.txt", sample=config["samples"])
+    output:
+        "results/qc_multiqc/multiqc_report.html"
+    log: "logs/multiqc/multiqc.log"
+    singularity: config["containers"]["multiqc"]
+    shell:
+        """
+        multiqc --force results -o results/qc_multiqc > {log} 2>&1
+        """

@@ -1,0 +1,21 @@
+samples:
+  - "Sample_A"
+  - "Sample_B"
+  - "Sample_C"
+
+paths:
+  base_dir: "/path/to/control_pipeline/lambda"
+
+  trimmed_reads_dir: "/path/to/snakemake/results/trimmed_reads"
+
+  results_dir: "/path/to/control_pipeline/lambda/results"
+
+  cntrl_genome_dir: "/path/to/genomes/lambda"
+
+qc:
+  cntrl_thresholds:
+    puc19_min_pct: 95.0
+
+containers:
+  bismark: "/cluster/work/users/abchap73/snakemake_test/containers/bismark_samtools.sif"
+  multiqc: "/cluster/work/users/abchap73/snakemake_test/containers/multiqc_1.14--pyhdfd78af_0.sif"

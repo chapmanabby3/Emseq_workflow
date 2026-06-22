@@ -1,0 +1,152 @@
+configfile: "config_lambda.yaml"
+
+import os
+
+# -------------------------
+# Helper contstants from config
+# -------------------------
+
+
+RESULTS = config["paths"]["results_dir"]
+TRIMMED = config["paths"]["trimmed_reads_dir"]
+CTRL_GENOME = config["paths"]["cntrl_genome_dir"]
+
+
+# -------------------------
+# Target rule
+# -------------------------
+###rule all defines the final outputs of the workflow###
+
+rule all:
+    input:
+        f"{RESULTS}/multiqc/multiqc_report_lambda.html",
+        expand(f"{RESULTS}/dedup/{{sample}}_deduplicated.sorted.bam.bai", sample=config["samples"]),
+        expand(f"{RESULTS}/methylation/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.deduplicated.CX_report.txt.gz", sample=config["samples"]),
+
+# -------------------------
+# Alignment to control genome
+# -------------------------
+
+rule bismark_align_cntrls:
+    input:
+        r1 = f"{TRIMMED}/{{sample}}_R1_trimmed_val_1.fq.gz",
+        r2 = f"{TRIMMED}/{{sample}}_R2_trimmed_val_2.fq.gz",
+        genome = CTRL_GENOME
+    output:
+        bam = f"{RESULTS}/aligned/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.bam",
+        report = f"{RESULTS}/aligned/{{sample}}_R1_trimmed_val_1_bismark_bt2_PE_report.txt"
+    threads: 4
+    resources:
+        mem_mb = 32000
+    singularity:
+        config["containers"]["bismark"]
+    shell:
+        r"""
+        mkdir -p {RESULTS}/aligned
+        echo "Running Bismark alignment for sample {wildcards.sample}"
+        bismark --genome {input.genome} \
+            -1 {input.r1} -2 {input.r2} \
+            --output_dir {RESULTS}/aligned \
+            --un --ambiguous \
+            --parallel {threads} \
+            --score_min L,0,-0.6
+        echo "Bismark alignment complete."
+        """
+
+
+# -------------------------
+# Deduplication
+# -------------------------
+rule deduplication_cntrls:
+    input:
+        bam = f"{RESULTS}/aligned/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.bam"
+    output:
+        bam = f"{RESULTS}/dedup/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.deduplicated.bam",
+        report = f"{RESULTS}/dedup/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.deduplication_report.txt"
+    singularity:
+        config["containers"]["bismark"]
+    shell:
+        r"""
+        mkdir -p {RESULTS}/dedup
+        deduplicate_bismark --bam --paired \
+            --output_dir {RESULTS}/dedup \
+            {input.bam}
+        """
+
+
+# -------------------------
+# Sort deduplicated BAM
+# -------------------------
+rule sort_dedup_bam:
+    input:
+        bam = f"{RESULTS}/dedup/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.deduplicated.bam"
+    output:
+        sorted_bam = f"{RESULTS}/dedup/{{sample}}_deduplicated.sorted.bam"
+    threads: 4
+    singularity:
+        config["containers"]["bismark"]
+    shell:
+        r"""
+        samtools sort -@ {threads} -o {output.sorted_bam} {input.bam}
+        """
+
+
+# -------------------------
+# Index sorted BAM
+# -------------------------
+rule index_sorted_bam:
+    input:
+        bam = f"{RESULTS}/dedup/{{sample}}_deduplicated.sorted.bam"
+    output:
+        bai = f"{RESULTS}/dedup/{{sample}}_deduplicated.sorted.bam.bai"
+    singularity:
+        config["containers"]["bismark"]
+    shell:
+        r"""
+        samtools index {input.bam}
+        """
+
+# -------------------------
+# Methylation extraction
+# -------------------------
+
+rule methylation_extraction_cntrls:
+    input:
+        bam = f"{RESULTS}/dedup/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.deduplicated.bam",
+        genome = CTRL_GENOME
+    output:
+        cx = f"{RESULTS}/methylation/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.deduplicated.CX_report.txt.gz",
+        mbias = f"{RESULTS}/methylation/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.deduplicated.M-bias.txt"
+    singularity:
+        config["containers"]["bismark"]
+    shell:
+        r"""
+        mkdir -p {RESULTS}/methylation
+        bismark_methylation_extractor \
+            --paired-end \
+            --gzip \
+            --CX \
+            --cytosine_report \
+            --genome_folder {input.genome} \
+            --output {RESULTS}/methylation \
+            {input.bam}
+        """
+
+
+# -------------------------
+# MultiQC
+# -------------------------
+rule multiqc_cntrls:
+    input:
+        expand(f"{RESULTS}/aligned/{{sample}}_R1_trimmed_val_1_bismark_bt2_PE_report.txt", sample=config["samples"]),
+        expand(f"{RESULTS}/dedup/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.deduplication_report.txt", sample=config["samples"]),
+        expand(f"{RESULTS}/methylation/{{sample}}_R1_trimmed_val_1_bismark_bt2_pe.deduplicated.M-bias.txt", sample=config["samples"]),
+    output:
+        f"{RESULTS}/multiqc/multiqc_report_lambda.html"
+    singularity:
+        config["containers"]["multiqc"]
+    shell:
+        r"""
+        mkdir -p {RESULTS}/multiqc
+        multiqc -n multiqc_report_lambda.html {RESULTS} -o {RESULTS}/multiqc
+        """

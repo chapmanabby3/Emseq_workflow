@@ -1,0 +1,25 @@
+samples:
+  - "sample_A"
+  - "sample_B"
+  - "sample_C"
+  - "sample_D"
+
+paths:
+  base_dir: "/cluster/work/users/USERNAME/snakemake_project"
+  data_dir: "data"
+  results_dir: "results"
+  genome_dir: "/cluster/work/users/USERNAME/snakemake_project/genome"
+
+containers:
+  trimgalore: "containers/trim-galore_0.6.10--hdfd78af_0.sif"
+  bismark: "containers/bismark_samtools.sif"
+  multiqc: "containers/multiqc_1.14--pyhdfd78af_0.sif"
+
+params:
+  sequences_file: "read_sequences.csv"
+
+  # Trim Galore settings
+  clip_r1: 10
+  clip_r2: 10
+  three_prime_clip_r1: 5
+  three_prime_clip_r2: 5

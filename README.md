@@ -3,7 +3,7 @@
 This repository contains a complete workflow for processing EM-seq / bisulfite sequencing data, from raw reads to differential methylation analysis and visualization.
 
 The pipeline is designed for execution on an HPC system (e.g. Saga) using Snakemake, Slurm, and R-based downstream analysis.
-
+This pipeline was created for DNA methylation analysis of a non model teleost fish (Boreogadus saida).
 ---
 
 ## Workflow Overview
@@ -35,7 +35,7 @@ Preparation of DSS input objects:
 
 ---
 
-### 04_R_analysis
+### 04_differential_methylation
 Downstream statistical analysis and visualization:
 - Pairwise differential methylation analysis using DSS
 - Identification of DMCs and DMRs
@@ -44,6 +44,23 @@ Downstream statistical analysis and visualization:
   - Volcano plots
   - Feature distribution pie charts
   - Summary tables for interpretation
+
+---
+
+### 05_functional_annotation
+-Annotating DMCs/DMRs to genomic features using UniProtKB/Swiss-Prot
+-Assigning CpGs/DMRs to genes
+-Gene-level summaries
+-Ortholog mapping
+
+---
+
+### 06_enrichment_analysis
+    - GO enrichment
+    - KEGG enrichment
+    - Reactome (if applicable)
+    - Visualization (dotplots, cnetplots, enrichment maps)
+    - Biological interpretation
 
 ---
 
@@ -101,7 +118,9 @@ Run Snakemake main pipeline (snakemake_main)
 Run control pipelines (snakemake_controls)
 Post-process CpG files (02_post_processing)
 Build DSS input objects (03_dss_input)
-Run pairwise DSS analysis + visualization (04_R_analysis)
+Run pairwise DSS analysis + visualization (04_differential_methylation)
+Gene annotation & enrichment analysis (05_functional_annotation)
+Enrichment analysis with GO/KEGG (06_enrichment_analysis)
 Software Requirements
 Snakemake (HPC execution mode)
 Bismark

@@ -174,10 +174,11 @@ tryCatch({
 
   #-----------------------------------------------------------
   # Call DMCs and DMRs
+  # 3 DMC minimum added for DMRs #
   #-----------------------------------------------------------
 
   dmc <- callDML(dml_test, delta = 0.20, p.threshold = 0.05)
-  dmr <- callDMR(dml_test, delta = 0.20, p.threshold = 0.01)
+  dmr <- callDMR(dml_test, delta = 0.20, p.threshold = 0.01, minlen = 100, minCG = 3)
 
   #-----------------------------------------------------------
   # Save outputs

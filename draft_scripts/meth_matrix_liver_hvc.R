@@ -11,6 +11,8 @@
 # 7. Saves the annotated DMR table, the regional methylation matrix, and a distribution pie chart.
 # 
 # Note: This is an exploratory/draft script and may not yet be modularized for the main pipeline.
+# This was performed on liver samples while troubleshooting the pipeline, as previously, the annotation and plot generating
+# script did not include a methylation matrix output.
 # ==============================================================================
 
 library(bsseq)

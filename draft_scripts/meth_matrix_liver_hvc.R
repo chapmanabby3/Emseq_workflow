@@ -4,7 +4,7 @@
 # Description and Functions:
 # 1. Loads an out-of-memory HDF5-backed BSseq object containing raw methylation calls.
 # 2. Generates consistent DMR IDs (e.g., "DMR_1") prior to any genomic coordinate filtering.
-# 3. Validates and filters DMR chromosomes against the seqlevels of a provided Polar Bear GTF.
+# 3. Validates and filters DMR chromosomes against the seqlevels of a provided Polar cod GTF.
 # 4. Annotates valid DMRs with genomic features (Promoter, Exon, Intron, etc.) via ChIPseeker.
 # 5. Joins the annotations back to the full set of DMRs. Unmappable scaffolds are flagged as "Unannotated".
 # 6. Extracts a matrix of average region-level methylation scores for each sample using getMeth().

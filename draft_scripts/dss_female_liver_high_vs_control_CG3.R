@@ -12,6 +12,8 @@
 #    downstream plotting and annotation.
 # 
 # Note: This is an exploratory/draft script and may not yet be modularized for the main pipeline.
+# This was performed on liver samples while troubleshooting the pipeline, as previously, DSS pairwise comparisons were run
+# without the DMR filter "minlen = 100, minCG = 3)" for the callDMR function.
 # ==============================================================================
 
 library(DSS)

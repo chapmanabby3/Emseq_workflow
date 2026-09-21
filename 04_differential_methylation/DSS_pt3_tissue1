@@ -1,0 +1,322 @@
+suppressPackageStartupMessages({
+  library(bsseq)
+  library(HDF5Array)
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(ChIPseeker)
+  library(txdbmaker)
+  library(DSS)
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(tidyr)
+  library(pheatmap)
+  library(qqman)
+  library(VennDiagram)
+})
+
+# ==============================================================================
+# 1. USER CONFIGURATION (user, just edit this section)
+# ==============================================================================
+
+# -- Paths --
+work_dir     <- "<PATH_TO_WORKING_DIRECTORY>"
+h5_dir       <- "<PATH_TO>/emseq_hdf5"
+gtf_file     <- "<PATH_TO_ANNOTATION_GENOME>"
+
+# Directory where the previous script saved the DSS pt 2 results#
+dss_res_dir  <- "<PATH_TO_DSSPT2_RESULTS>" 
+output_dir   <- "downstream_results_final"
+
+# -- Thresholds --
+dmc_delta       <- 0.20
+dmc_fdr         <- 0.05
+dmr_delta       <- 0.20
+dmr_p_threshold <- 0.01
+dmr_minlen      <- 100
+dmr_minCG       <- 3
+
+# -- Experimental Design --
+sexes_to_test <- c("female", "male")
+comparisons_to_run <- list(
+  c("high", "control"),
+  c("low",  "control"),
+  c("high", "low")
+)
+
+# -- Sample Metadata --
+sample_info <- data.frame(
+    id = c(
+    "<SAMPLE_ID_1>", "<SAMPLE_ID_2>", "<SAMPLE_ID_3>",
+    "<SAMPLE_ID_4>", "<SAMPLE_ID_5>", "<SAMPLE_ID_6>",
+    "<SAMPLE_ID_7>", "<SAMPLE_ID_8>", "<SAMPLE_ID_9>",
+    "<SAMPLE_ID_10>", "<SAMPLE_ID_11>", "<SAMPLE_ID_12>",
+    "<SAMPLE_ID_13>", "<SAMPLE_ID_14>", "<SAMPLE_ID_15>",
+    "<SAMPLE_ID_16>", "<SAMPLE_ID_17>", "<SAMPLE_ID_18>",
+    "<SAMPLE_ID_19>", "<SAMPLE_ID_20>", "<SAMPLE_ID_21>",
+    "<SAMPLE_ID_22>", "<SAMPLE_ID_23>", "<SAMPLE_ID_24>",
+    "<SAMPLE_ID_25>", "<SAMPLE_ID_26>", "<SAMPLE_ID_27>"
+  ),
+  condition = c(
+    "<CONDITION_1>", "<CONDITION_2>", "<CONDITION_3>", "<CONDITION_4>",
+    "<CONDITION_5>", "<CONDITION_6>", "<CONDITION_7>", "<CONDITION_8>",
+    "<CONDITION_9>", "<CONDITION_10>", "<CONDITION_11>", "<CONDITION_12>",
+    "<CONDITION_13>", "<CONDITION_14>", "<CONDITION_15>", "<CONDITION_16>",
+    "<CONDITION_17>", "<CONDITION_18>", "<CONDITION_19>", "<CONDITION_20>",
+    "<CONDITION_21>", "<CONDITION_22>", "<CONDITION_23>", "<CONDITION_24>",
+    "<CONDITION_25>", "<CONDITION_26>", "<CONDITION_27>"
+  ),
+  sex = c(
+    rep("group1_label", <N_GROUP1>),
+    rep("group2_label", <N_GROUP2>)
+  )
+
+# ==============================================================================
+# 2. SETUP & DATA LOADING
+# ==============================================================================
+setwd(work_dir)
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+message("Loading BSseq object and mapping metadata...")
+bsseq_obj <- as(loadHDF5SummarizedExperiment(h5_dir), "BSseq")
+rownames(sample_info) <- sample_info$id
+pData(bsseq_obj) <- sample_info
+
+message("Loading TxDb annotation...")
+txdb <- makeTxDbFromGFF(gtf_file, format = "gtf")
+gtf_gr <- import(gtf_file)
+gtf_meta <- mcols(gtf_gr)[, c("gene_id", "transcript_id")]
+gtf_meta$strand <- as.character(strand(gtf_gr))
+gtf_meta_unique <- as.data.frame(gtf_meta[!duplicated(gtf_meta$gene_id), ])
+
+##edited colors below to be more colorblind friendly##
+##Okabe-Ito color pallette##
+
+feature_colors <- c(
+  "Promoter"    = "#E69F00",  # Gold/Orange
+  "Exon"        = "#56B4E9",  # Soft Blue
+  "Intron"      = "#009E73",  # Green
+  "UTR"         = "#F0E442",  # Yellow
+  "Downstream"  = "#0072B2",  # Dark Blue
+  "TSS"         = "#D55E00",  # Dark Orange
+  "Intergenic"  = "#CC79A7",  # Pink
+  "Other"       = "#404040",  # Charcoal
+  "Unannotated" = "#999999"   # Medium gray
+)
+
+
+remove_zero_var <- function(mat) {
+  row_var <- apply(mat, 1, var, na.rm = TRUE)
+  mat[row_var > 0, , drop = FALSE]
+}
+
+# ==============================================================================
+# 3. CORE ANALYSIS FUNCTION
+# ==============================================================================
+analyze_dss_results <- function(dml_file_path, sex_group, g1_cond, g2_cond, bsseq_data, metadata, base_out) {
+  
+  comp_name <- paste0(g1_cond, "_vs_", g2_cond)
+  group_label <- paste0(sex_group, "_", comp_name)
+  message(paste("\n--- Analyzing:", toupper(group_label), "---"))
+  
+  # Directorios específicos para esta comparación
+  comp_out <- file.path(base_out, sex_group, comp_name)
+  dir.create(comp_out, showWarnings = FALSE, recursive = TRUE)
+  dir.create(file.path(comp_out, "plots"), showWarnings = FALSE)
+  dir.create(file.path(comp_out, "GO"), showWarnings = FALSE)
+  
+  # Load DML result
+  dml_result <- readRDS(dml_file_path)
+  
+  # FILTER METADATA AND BSSEQ EXCLUSIVELY FOR THE TWO GROUPS
+  group_meta <- metadata %>% filter(sex == sex_group & condition %in% c(g1_cond, g2_cond))
+  group_sample_ids <- group_meta$id
+  bsseq_group <- bsseq_data[, group_sample_ids]
+  
+  # --- 1. CALL DMCs & DMRs ---
+  dmcs_all <- callDML(dml_result, delta = 0, p.threshold = 0.05)
+  dmcs_filt <- callDML(dml_result, delta = dmc_delta, p.threshold = dmc_fdr)
+  if(!is.null(dmcs_filt)) dmcs_filt <- dmcs_filt[dmcs_filt$fdr < dmc_fdr, ]
+  
+  dmrs_filt <- callDMR(dml_result, delta = dmr_delta, p.threshold = dmr_p_threshold, minlen = dmr_minlen, minCG = dmr_minCG)
+  
+  # Export raw tables
+  if(!is.null(dmcs_filt) && nrow(dmcs_filt) > 0) write.table(dmcs_filt, file.path(comp_out, paste0("DMCs_filtered_", group_label, ".txt")), sep = "\t", quote = FALSE, row.names = FALSE)
+  if(!is.null(dmrs_filt) && nrow(dmrs_filt) > 0) write.table(dmrs_filt, file.path(comp_out, paste0("DMRs_filtered_", group_label, ".txt")), sep = "\t", quote = FALSE, row.names = FALSE)
+  
+  if(is.null(dmrs_filt) && is.null(dmcs_filt)) {
+    warning(paste("No significant DMCs or DMRs found for", group_label, "Skipping plots."))
+    return(list(dmc_genes = character(0), dmr_genes = character(0)))
+  }
+  
+  # --- 2. GRANGES PREP ---
+  dmc_sig_gr <- GRanges()
+  dmr_gr <- GRanges()
+  
+  if(!is.null(dmcs_filt) && nrow(dmcs_filt) > 0) {
+    dmc_gr <- GRanges(seqnames = dmcs_all$chr, ranges = IRanges(start = dmcs_all$pos, width = 1), strand = "*", fdr = dmcs_all$fdr)
+    dmc_sig_gr <- GRanges(seqnames = dmcs_filt$chr, ranges = IRanges(start = dmcs_filt$pos, width = 1), strand = "*", fdr = dmcs_filt$fdr)
+  }
+  
+  if(!is.null(dmrs_filt) && nrow(dmrs_filt) > 0) {
+    dmr_gr <- GRanges(seqnames = dmrs_filt$chr, ranges = IRanges(start = dmrs_filt$start, end = dmrs_filt$end), strand = "*", 
+                      dmr_id = paste(dmrs_filt$chr, dmrs_filt$start, dmrs_filt$end, sep = ":"))
+    
+    # METHYLATION MATRIX FOR DMRs
+    dmr_meth_matrix <- getMeth(bsseq_group, type = "raw", regions = dmr_gr, what = "perRegion")
+    rownames(dmr_meth_matrix) <- dmr_gr$dmr_id
+    colnames(dmr_meth_matrix) <- colnames(bsseq_group)
+    write.csv(dmr_meth_matrix, file.path(comp_out, paste0("DMR_methylation_matrix_", group_label, ".csv")), quote = FALSE)
+  }
+  
+  # --- 3. ANNOTATION ---
+  annotate_and_format <- function(gr, name_label) {
+    if(length(gr) == 0) return(data.frame())
+    anno <- as.data.frame(annotatePeak(gr, TxDb = txdb, tssRegion = c(-2000, 2000), verbose = FALSE))
+    anno$feature_category <- case_when(
+      grepl("Promoter", anno$annotation) ~ "Promoter", grepl("Exon", anno$annotation) ~ "Exon",
+      grepl("Intron", anno$annotation) ~ "Intron", grepl("UTR", anno$annotation) ~ "UTR",
+      grepl("Downstream", anno$annotation) ~ "Downstream", grepl("TSS", anno$annotation) ~ "TSS",
+      grepl("Intergenic", anno$annotation) ~ "Intergenic", TRUE ~ "Other"
+    )
+    df_final <- left_join(anno, gtf_meta_unique, by = c("geneId" = "gene_id"))
+    write.table(df_final, file.path(comp_out, paste0(name_label, "_annotated_", group_label, ".txt")), sep = "\t", quote = FALSE, row.names = FALSE)
+    return(df_final)
+  }
+  
+  dmc_anno_df <- annotate_and_format(dmc_gr, "ALL_DMCs")
+  dmc_sig_anno_df <- annotate_and_format(dmc_sig_gr, "DSS_sign_DMCs")
+  dmr_anno_df <- annotate_and_format(dmr_gr, "DSS_DMRs")
+  
+  # --- 4. PLOTTING ---
+  
+  if(nrow(dmc_sig_anno_df) > 0) {
+    # A. Pie Chart
+    category_counts <- dmc_sig_anno_df %>% count(feature_category) %>% complete(feature_category = names(feature_colors), fill = list(n = 0)) %>%
+      mutate(percentage = round(100 * n / sum(n), 1), legend_label = paste0(feature_category, " (", percentage, "%)"))
+    
+    pie_plot <- ggplot(category_counts, aes(x = "", y = n, fill = feature_category)) +
+      geom_col(width = 1, color = "white") + coord_polar("y") +
+      scale_fill_manual(values = feature_colors, labels = category_counts$legend_label) + theme_void() +
+      labs(title = paste("Significant DMCs by Feature -", group_label), fill = "Category")
+    ggsave(file.path(comp_out, paste0("plots/pie_chart_", group_label, ".png")), pie_plot, width = 8, height = 6, bg="white")
+    
+    # B. Volcano Plot
+    dmcs_annotated <- merge(dmcs_all, dmc_anno_df[, c("start", "geneId")], by.x = "pos", by.y = "start", all.x = TRUE)
+    dmcs_annotated$Gene <- ifelse(is.na(dmcs_annotated$geneId), paste0(dmcs_annotated$chr, "_", dmcs_annotated$pos), dmcs_annotated$geneId)
+    
+    dmcs_annotated <- dmcs_annotated %>% mutate(direction = case_when(
+      diff > dmc_delta & fdr < dmc_fdr ~ "Hyper",
+      diff < -dmc_delta & fdr < dmc_fdr ~ "Hypo",
+      TRUE ~ "NotSig"
+    ))
+    
+    top_dmcs <- dmcs_annotated %>% filter(fdr < dmc_fdr, !is.na(geneId)) %>% group_by(geneId) %>%
+      slice_min(fdr, n = 1, with_ties = FALSE) %>% ungroup() %>% slice_min(fdr, n = 20, with_ties = FALSE)
+    
+    volcano <- ggplot(dmcs_annotated, aes(x = diff, y = -log10(fdr))) +
+      geom_point(aes(color = direction), alpha = 0.6) + scale_color_manual(values = c("Hyper" = "#E64A19", "Hypo" = "#1976D2", "NotSig" = "grey")) +
+      geom_vline(xintercept = c(-dmc_delta, dmc_delta), linetype = "dashed") + geom_hline(yintercept = -log10(dmc_fdr), linetype = "dashed") +
+      geom_text_repel(data = top_dmcs, aes(label = Gene), size = 3, max.overlaps = 30) +
+      theme_minimal() + labs(title = paste("Volcano Plot -", group_label), x = "Methylation Difference", y = "-log10(FDR)")
+    ggsave(file.path(comp_out, paste0("plots/volcano_plot_", group_label, ".png")), volcano, width = 8, height = 6, bg="white")
+    
+    # C. Heatmap (Top 50 by Diff)
+    dmcs_for_heatmap <- dmcs_annotated %>% filter(fdr < dmc_fdr, !is.na(geneId)) %>% group_by(geneId) %>%
+      slice_max(abs(diff), n = 1, with_ties = FALSE) %>% ungroup() %>% slice_max(abs(diff), n = 50, with_ties = FALSE)
+    
+    if(nrow(dmcs_for_heatmap) > 2) {
+      top_gr <- GRanges(seqnames = dmcs_for_heatmap$chr, ranges = IRanges(start = dmcs_for_heatmap$pos, width = 1))
+      meth_mat_hm <- getMeth(bsseq_group, type = "raw", regions = top_gr, what = "perRegion")
+      colnames(meth_mat_hm) <- colnames(bsseq_group)
+      meth_mat_scaled <- t(scale(t(remove_zero_var(meth_mat_hm))))
+      
+      png(file.path(comp_out, paste0("plots/heatmap_top50_", group_label, ".png")), width = 800, height = 600)
+      pheatmap(meth_mat_scaled, cluster_rows = TRUE, cluster_cols = TRUE, 
+               annotation_col = group_meta[, "condition", drop=FALSE], 
+               show_rownames = FALSE, main = paste("Top 50 Diff Sites -", group_label))
+      dev.off()
+    }
+    
+    # GO Exports
+    genes_dmc <- na.omit(unique(dmc_sig_anno_df$geneId))
+    writeLines(genes_dmc, file.path(comp_out, paste0("GO/genes_DMC_", group_label, ".txt")))
+  } else { genes_dmc <- character(0) }
+  
+  if(nrow(dmr_anno_df) > 0) {
+    genes_dmr <- na.omit(unique(dmr_anno_df$geneId))
+    writeLines(genes_dmr, file.path(comp_out, paste0("GO/genes_DMR_", group_label, ".txt")))
+  } else { genes_dmr <- character(0) }
+  
+  # Clear memory
+  rm(bsseq_group, dmcs_all, dmcs_filt)
+  gc(verbose = FALSE)
+  
+  return(list(dmc_genes = genes_dmc, dmr_genes = genes_dmr))
+}
+
+# ==============================================================================
+# 4. EXECUTION LOOP
+# ==============================================================================
+message("\nStarting automated downstream pipeline...")
+
+# Estructura para guardar los genes de cada comparación y usarlos en los Venn
+gene_lists_for_venn <- list()
+
+for (current_sex in sexes_to_test) {
+  
+  gene_lists_for_venn[[current_sex]] <- list()
+  
+  for (comp in comparisons_to_run) {
+    g1_cond <- comp[1]
+    g2_cond <- comp[2]
+    comp_name <- paste0(g1_cond, "_vs_", g2_cond)
+    
+    # Buscar el archivo .rds generado por el script previo
+    expected_rds <- file.path(work_dir, dss_res_dir, current_sex, comp_name, 
+                              paste0("dml_result_", current_sex, "_", comp_name, ".rds"))
+    
+    if (file.exists(expected_rds)) {
+      results <- analyze_dss_results(
+        dml_file_path = expected_rds,
+        sex_group = current_sex,
+        g1_cond = g1_cond,
+        g2_cond = g2_cond,
+        bsseq_data = bsseq_obj,
+        metadata = sample_info,
+        base_out = output_dir
+      )
+      # Guardamos los genes significativos para el diagrama de Venn
+      gene_lists_for_venn[[current_sex]][[comp_name]] <- results$dmc_genes
+    } else {
+      message(paste("Skipping", current_sex, comp_name, "- file not found:", expected_rds))
+    }
+  }
+}
+
+# ==============================================================================
+# 5. VENN DIAGRAMS (3-Way by Sex)
+# ==============================================================================
+message("\nGenerating Venn Diagrams...")
+
+for (current_sex in sexes_to_test) {
+  # Solo crear Venn si existen las 3 comparaciones para ese sexo
+  if (length(gene_lists_for_venn[[current_sex]]) == 3) {
+    
+    venn.diagram(
+      x = list(
+        "High vs Control" = gene_lists_for_venn[[current_sex]][["high_vs_control"]],
+        "Low vs Control"  = gene_lists_for_venn[[current_sex]][["low_vs_control"]],
+        "High vs Low"     = gene_lists_for_venn[[current_sex]][["high_vs_low"]]
+      ),
+      filename = file.path(output_dir, current_sex, paste0("Venn_DMC_Overlap_", current_sex, ".png")),
+      imagetype = "png", height = 2000, width = 2000, resolution = 300,
+      fill = c("#FF9999", "#9999FF", "#99FF99"), 
+      cex = 1.5, fontface = "bold", cat.cex = 1.2, cat.default.pos = "outer",
+      main = paste(toupper(current_sex), "- DMCs Overlap Across Conditions"), main.cex = 1.5
+    )
+    message(paste("Saved 3-way Venn diagram for:", current_sex))
+  }
+}
+
+message("\nPipeline Finished Successfully!")

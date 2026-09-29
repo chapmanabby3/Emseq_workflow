@@ -66,3 +66,28 @@ The final output contains the original DMC annotation together with:
 - final gene label used for downstream analyses
 
 These gene labels are subsequently used for ortholog mapping and functional enrichment analyses.
+
+Further Gene Identification Workflow:
+
+DMC/DMR statistical results
+            |
+            v
+Polar-cod genomic annotation
+            |
+            v
+Polar-cod locus or transcript IDs
+            |
+            v
+BLASTP against Swiss-Prot
+            |
+            v
+Gene symbols and functional descriptions
+            |
+            v
+Unresolved loci
+            |
+            +--> DNA sequence extraction → blastn
+            |
+            +--> Protein sequence/homolog → tblastn
+            |
+            +--> No convincing coding model → ncRNA search

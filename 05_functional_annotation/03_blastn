@@ -1,0 +1,573 @@
+###############################################################################
+# Extract DMR DNA sequences and run blastn against the polar-cod genome
+###############################################################################
+
+library(data.table)
+library(dplyr)
+library(readr)
+library(stringr)
+library(tibble)
+
+###############################################################################
+# USER SETTINGS
+###############################################################################
+
+setwd("<PATH TO WORKING DIRECTORY>")
+
+# Exact polar-cod reference genome used for EM-seq alignment
+genome_fasta <- "<PATH TO REFERENCE GENOME>"
+
+# Existing local database name/prefix
+blast_db <- "polar_cod_genome_db"
+
+# Executables; change paths if required on your HPC system
+samtools_exe    <- "samtools"
+makeblastdb_exe <- "makeblastdb"
+blastn_exe      <- "blastn"
+
+# Output directory
+output_dir <- "blastn_DMR_results"
+dir.create(output_dir, showWarnings = FALSE)
+
+# TRUE = create/index genome database automatically
+build_database <- TRUE
+
+###############################################################################
+# INPUT DMR TABLES
+###############################################################################
+
+comparisons <- tibble(
+  comparison = c(
+    "group1_vs_group2",
+    "group1_vs_group3",
+    "group2_vs_group3"
+  ),
+
+  dmr_file = c(
+    "group1_vs_group2/DMRs_with_gene_symbols_group1_vs_group2_pfg.csv",
+    "group1_vs_group3/DMRs_with_gene_symbols_group1_vs_group3_pfg.csv",
+    "group2_vs_group3/DMRs_with_gene_symbols_group2_vs_group3_pfg.csv"
+  ),
+
+  dmr_output_file = c(
+    "group1_vs_group2/DMRs_blastn_group1_vs_group2_pfg.csv",
+    "group1_vs_group3/DMRs_blastn_group1_vs_group3_pfg.csv",
+    "group2_vs_group3/DMRs_blastn_group2_vs_group3_pfg.csv"
+  ),
+
+  output_prefix = c(
+    "group1_vs_group2",
+    "group1_vs_group3",
+    "group2_vs_group3"
+  )
+)
+
+###############################################################################
+# CHECK REQUIRED FILES AND PROGRAMS
+###############################################################################
+
+if (!file.exists(genome_fasta)) {
+  stop("Genome FASTA not found: ", genome_fasta)
+}
+
+for (i in seq_len(nrow(comparisons))) {
+  if (!file.exists(comparisons$dmr_file[i])) {
+    stop("DMR file not found: ", comparisons$dmr_file[i])
+  }
+}
+
+if (system2(samtools_exe, "--version", stdout = TRUE, stderr = TRUE)[1] == "") {
+  warning("Could not verify samtools. Check that it is in PATH.")
+}
+
+###############################################################################
+# INDEX THE REFERENCE GENOME -Do I need this?
+###############################################################################
+
+genome_index <- file.path(output_dir, "polar_cod.fa.fai")
+
+if (!file.exists(genome_index)) {
+  message("Creating FASTA index...")
+  status <- system2(
+    samtools_exe,
+    args = c(
+      "faidx",
+      "--fai-idx", shQuote(genome_index),
+      shQuote(genome_fasta)
+    )
+  )
+
+  if (status != 0 || !file.exists(genome_index)) {
+    stop("samtools faidx failed.")
+  }
+}
+
+###############################################################################
+# BUILD THE LOCAL NUCLEOTIDE BLAST DATABASE
+##not sure why this does not look like my swissprot template, which is more like###
+#makeblastdb \
+ # -in polar_cod_reference.fa \
+ # -dbtype nucl \
+ # -parse_seqids \
+ # -out polar_cod_genome_db
+###############################################################################
+
+if (build_database) {
+  message("Building nucleotide BLAST database...")
+
+  db_command <- system2(
+    makeblastdb_exe,
+    args = c(
+      "-in", shQuote(genome_fasta),
+      "-dbtype", "nucl",
+      "-parse_seqids",
+      "-out", shQuote(blast_db),
+      "-title", shQuote("<POLAR COD REFERENCE GNOME>.fa")
+    )
+  )
+
+  if (db_command != 0) {
+    stop("makeblastdb failed.")
+  }
+}
+
+###############################################################################
+# READ DMR TABLE
+###############################################################################
+
+read_dmr_table <- function(file) {
+  message("Reading: ", file)
+
+  tbl <- read_delim(
+    file,
+    delim = ",",
+    show_col_types = FALSE,
+    na = c("", "NA", "NaN")
+  )
+
+  # If the file is tab-delimited despite having a .csv extension,
+  # read it again using tab separation.
+  if (ncol(tbl) == 1) {
+    tbl <- read_delim(
+      file,
+      delim = "\t",
+      show_col_types = FALSE,
+      na = c("", "NA", "NaN")
+    )
+  }
+
+  required_columns <- c("seqnames", "start", "end", "dmr_id")
+
+  missing_columns <- setdiff(required_columns, colnames(tbl))
+
+  if (length(missing_columns) > 0) {
+    stop(
+      "Missing required columns in ", file, ": ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+
+  tbl
+}
+
+###############################################################################
+# SELECT DMRs FOR blastn
+###############################################################################
+###i think this might need some more work/more decisions about this###
+
+
+select_DMRs_for_blastn <- function(tbl) {
+
+  tbl %>%
+    mutate(
+      seqnames = as.character(seqnames),
+      start = as.integer(start),
+      end = as.integer(end),
+
+      no_swissprot_hit =
+        is.na(sseqid) |
+        sseqid == "" |
+        sseqid == "NA",
+
+###for now, we comment out unresolved locus filter
+####this is because selecting DMRs from the table which have BOTH no sequence ID and unresolved locus is too strict,
+###we may miss DMRs which still need to be defined.
+
+   ###   unresolved_locus =
+       # is.na(gene_symbol) |
+       # gene_symbol == "" |
+       # gene_symbol == "NA" |
+       # grepl("^unassigned", geneId, ignore.case = TRUE),
+
+      valid_coordinates =
+        !is.na(seqnames) &
+        !is.na(start) &
+        !is.na(end) &
+        start >= 1 &
+        end >= start
+    ) %>%
+    filter(
+      valid_coordinates,
+      no_swissprot_hit
+    )
+}
+
+###############################################################################
+# CREATE REGION LIST FOR samtools faidx
+###############################################################################
+
+make_region_file <- function(tbl, region_file) {
+
+  regions <- tbl %>%
+    mutate(
+      region = paste0(seqnames, ":", start, "-", end)
+    ) %>%
+    distinct(region) %>%
+    pull(region)
+
+  writeLines(regions, region_file)
+
+  invisible(regions)
+}
+
+###############################################################################
+# EXTRACT DMR DNA SEQUENCES
+###############################################################################
+
+extract_sequences <- function(region_file, fasta_file, output_fasta) {
+
+  message("Extracting sequences from reference genome...")
+
+  status <- system2(
+    samtools_exe,
+    args = c(
+      "faidx",
+      "--fai-idx", shQuote(genome_index),
+      shQuote(fasta_file),
+      "-r", shQuote(region_file)
+    ),
+    stdout = output_fasta
+  )
+
+  if (status != 0 || !file.exists(output_fasta)) {
+    stop("Sequence extraction failed for: ", region_file)
+  }
+
+  invisible(output_fasta)
+}
+
+###############################################################################
+# MAKE UNIQUE FASTA IDS THAT CAN BE LINKED BACK TO DMR TABLE
+###############################################################################
+
+rename_fasta_headers <- function(input_fasta, output_fasta, tbl) {
+
+  fasta_lines <- readLines(input_fasta)
+
+  header_indices <- which(startsWith(fasta_lines, ">"))
+
+  if (length(header_indices) != nrow(tbl)) {
+    warning(
+      "Number of FASTA sequences does not equal number of selected DMRs. ",
+      "Check for duplicate regions or missing scaffold names."
+    )
+  }
+
+  dmr_ids <- make.unique(as.character(tbl$dmr_id))
+
+  header_map <- tbl %>%
+    mutate(
+      query_id = dmr_ids,
+      region = paste0(seqnames, ":", start, "-", end)
+    ) %>%
+    select(
+      query_id,
+      dmr_id,
+      region,
+      seqnames,
+      start,
+      end,
+      geneId,
+      feature_category
+    )
+
+  map_file <- paste0(output_fasta, ".metadata.tsv")
+
+  write_tsv(header_map, map_file)
+
+  current_header <- 0
+
+  for (i in seq_along(fasta_lines)) {
+    if (startsWith(fasta_lines[i], ">")) {
+      current_header <- current_header + 1
+
+      if (current_header <= length(dmr_ids)) {
+        fasta_lines[i] <- paste0(">", dmr_ids[current_header])
+      }
+    }
+  }
+
+  writeLines(fasta_lines, output_fasta)
+
+  invisible(header_map)
+}
+
+###############################################################################
+# RUN blastn
+###############################################################################
+####these are parameters which need to be defined#########
+###"-evalue", "#",
+###"-max_target_seqs", "#",
+###"-num_threads", "#"###
+###may be best to begin with -max_target_seqs at 20 and later narrow down to 10####
+
+
+run_blastn <- function(query_fasta, database, output_file) {
+
+  message("Running blastn: ", query_fasta)
+
+  blast_columns <- paste(
+    "qseqid",
+    "sseqid",
+    "pident",
+    "length",
+    "mismatch",
+    "gapopen",
+    "qstart",
+    "qend",
+    "sstart",
+    "send",
+    "evalue",
+    "bitscore",
+    "qlen",
+    "slen",
+    sep = " "
+  )
+
+  status <- system2(
+    blastn_exe,
+    args = c(
+      "-query", shQuote(query_fasta),
+      "-db", shQuote(database),
+      "-out", shQuote(output_file),
+      "-outfmt", shQuote(paste("6", blast_columns)),
+      "-evalue", "1e-10",
+      "-max_target_seqs", "20",
+      "-num_threads", "4"
+    )
+  )
+
+  if (status != 0) {
+    stop("blastn failed for: ", query_fasta)
+  }
+
+  invisible(output_file)
+}
+
+###########ensure number of threads above matches number of threads requested in submission file################
+
+###############################################################################
+# READ AND SUMMARIZE blastn RESULTS
+###############################################################################
+
+read_blastn_results <- function(blast_file) {
+
+  blast_columns <- c(
+    "qseqid",
+    "sseqid",
+    "pident",
+    "length",
+    "mismatch",
+    "gapopen",
+    "qstart",
+    "qend",
+    "sstart",
+    "send",
+    "evalue",
+    "bitscore",
+    "qlen",
+    "slen"
+  )
+
+  if (!file.exists(blast_file) || file.info(blast_file)$size == 0) {
+    return(tibble())
+  }
+
+  read_tsv(
+    blast_file,
+    col_names = blast_columns,
+    show_col_types = FALSE
+  ) %>%
+    mutate(
+      query_coverage = 100 * length / qlen,
+      subject_coverage = 100 * length / slen
+    ) %>%
+    group_by(qseqid) %>%
+    arrange(evalue, desc(bitscore), desc(query_coverage)) %>%
+    slice(1) %>%
+    ungroup()
+}
+
+###############################################################################
+# PROCESS EACH COMPARISON
+###############################################################################
+
+for (i in seq_len(nrow(comparisons))) {
+
+  comparison <- comparisons$comparison[i]
+  prefix <- comparison
+  dmr_file <- comparisons$dmr_file[i]
+  dmr_output_file <- comparisons$dmr_output_file[i]
+
+  message("\n==============================================")
+  message("Processing: ", comparison)
+  message("==============================================")
+
+  dmr <- read_dmr_table(dmr_file)
+
+  selected_dmr <- select_DMRs_for_blastn(dmr)
+
+  message("Total DMRs: ", nrow(dmr))
+  message("Selected for blastn: ", nrow(selected_dmr))
+
+  if (nrow(selected_dmr) == 0) {
+    warning("No DMRs selected for ", comparison)
+    next
+  }
+
+  # Make unique query IDs
+  selected_dmr <- selected_dmr %>%
+    mutate(
+      query_id = paste0(
+        prefix, "__DMR_", row_number()
+      ),
+      region = paste0(seqnames, ":", start, "-", end)
+    )
+
+  region_file <- file.path(
+    output_dir,
+    paste0(prefix, "_regions.txt")
+  )
+
+  raw_fasta <- file.path(
+    output_dir,
+    paste0(prefix, "_raw_DMR_sequences.fa")
+  )
+
+  query_fasta <- file.path(
+    output_dir,
+    paste0(prefix, "_blastn_queries.fa")
+  )
+
+  blast_output <- file.path(
+    output_dir,
+    paste0(prefix, "_blastn_results.tsv")
+  )
+
+  selected_table <- file.path(
+    output_dir,
+    paste0(prefix, "_selected_DMRs.tsv")
+  )
+
+  annotated_output <- dmr_output_file
+  
+  # Write the selected DMR table
+  write_tsv(selected_dmr, selected_table)
+
+  # Write regions and extract DNA
+  writeLines(selected_dmr$region, region_file)
+
+  message("Extracting DNA sequences...")
+  extract_status <- system(
+    paste(
+      shQuote(samtools_exe),
+      "faidx",
+      "--fai-idx",
+      shQuote(genome_index),
+      shQuote(genome_fasta),
+      "-r",
+      shQuote(region_file),
+      ">",
+      shQuote(raw_fasta)
+    )
+  )
+
+  if (extract_status != 0) {
+    stop("samtools sequence extraction failed.")
+  }
+
+  # Rename FASTA headers using query_id values
+  raw_lines <- readLines(raw_fasta)
+  header_positions <- which(startsWith(raw_lines, ">"))
+
+  if (length(header_positions) != nrow(selected_dmr)) {
+    stop(
+      "The number of extracted sequences (",
+      length(header_positions),
+      ") does not equal the number of selected DMRs (",
+      nrow(selected_dmr),
+      "). Check scaffold names and coordinates."
+    )
+  }
+
+  header_counter <- 0
+
+  for (j in seq_along(raw_lines)) {
+    if (startsWith(raw_lines[j], ">")) {
+      header_counter <- header_counter + 1
+      raw_lines[j] <- paste0(">", selected_dmr$query_id[header_counter])
+    }
+  }
+
+  writeLines(raw_lines, query_fasta)
+
+  query_metadata <- selected_dmr %>%
+    select(
+      query_id,
+      dmr_id,
+      seqnames,
+      start,
+      end,
+      width,
+      geneId,
+      transcriptId,
+      feature_category,
+      gene_symbol,
+      protein_id,
+      sseqid
+    )
+
+  metadata_file <- file.path(
+    output_dir,
+    paste0(prefix, "_blastn_query_metadata.tsv")
+  )
+
+  write_tsv(query_metadata, metadata_file)
+
+  # Run blastn
+  run_blastn(
+    query_fasta = query_fasta,
+    database = blast_db,
+    output_file = blast_output
+  )
+
+  # Read best BLAST hit per query
+  best_hits <- read_blastn_results(blast_output)
+
+  # Join BLAST results back to original selected DMRs
+  final_table <- selected_dmr %>%
+    left_join(
+      best_hits,
+      by = c("query_id" = "qseqid")
+    )
+
+  write_csv(final_table, annotated_output)
+
+  message("Wrote:")
+  message("  Query FASTA: ", query_fasta)
+  message("  BLAST results: ", blast_output)
+  message("  Final table: ", annotated_output)
+  message("  Best hits: ", nrow(best_hits))
+}
+
+message("\nAll comparisons completed.")

@@ -91,3 +91,15 @@ Unresolved loci
             +--> Protein sequence/homolog → tblastn
             |
             +--> No convincing coding model → ncRNA search
+
+            OR Current Draft Option:
+            Right now I am trying (after swissp):
+            -blastp to atlantic cod reference
+            -eggNOG mapper
+            -GO & KEGG
+
+            For eggNOG mapper:
+            1. prep_eggNOG_quer_pfg.R (submit with run_eggN_quer_prep_pfg.sh)
+            2. run_eggNOG_pfg.sh
+            3. merge_eggNOG_pfg.R
+            4. GO_KEGG_pfg.R (no submission script yet-written to cover DMCs after swissp and DMRs after eggNOG for now)

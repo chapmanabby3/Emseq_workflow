@@ -93,13 +93,14 @@ Unresolved loci
             +--> No convincing coding model → ncRNA search
 
             OR Current Draft Option:
-            Right now I am trying (after swissp):
+            Right now I am running (after swissp):
             -blastp to atlantic cod reference
             -eggNOG mapper
             -GO & KEGG
-
-            For eggNOG mapper:
-            1. prep_eggNOG_quer_pfg.R (submit with run_eggN_quer_prep_pfg.sh)
-            2. run_eggNOG_pfg.sh
-            3. merge_eggNOG_pfg.R
-            4. GO_KEGG_pfg.R (no submission script yet-written to cover DMCs after swissp and DMRs after eggNOG for now)
+            1. atl_blastp_pfg.R
+            2. prep_eggNOG_quer_pfg.R (submit with run_eggN_quer_prep_pfg.sh)
+            3. run_eggNOG_pfg.sh
+            4. merge_eggNOG_pfg.R
+            5. ncRNA_pfg.sh
+            6. merge_rfam_pfg.R
+            4. (Must blast all DMRs against atl cod prior to GO & KEGG steps)

@@ -1,0 +1,506 @@
+###############################################################################
+# Atlantic cod BLASTP annotation for DMRs without Swiss-Prot hits
+# perplexity draft 27.10.2026 #
+#
+# What this script does:
+#   1. Reads existing Swiss-Prot-annotated DMR CSV files.
+#   2. Selects DMRs with no Swiss-Prot hit (sseqid is NA/blank).
+#   3. Extracts the polar cod proteins associated with those DMRs.
+#   4. Runs BLASTP against Atlantic cod RefSeq proteins.
+#   5. Adds Atlantic cod results to the original CSV using blast_atl_ columns.
+#   6. Writes a new CSV for each comparison.
+#
+# Run this on the HPC/cluster in R.
+#
+# Required files:
+#   - Your existing Swiss-Prot-annotated DMR CSV files
+#   - Your full polar cod predicted-protein FASTA
+#
+# The Atlantic cod RefSeq protein FASTA is downloaded automatically if absent.
+###############################################################################
+
+library(data.table)
+library(tidyverse)
+
+###############################################################################
+# 1. EDIT THESE SETTINGS
+###############################################################################
+
+# Working directory
+setwd("<PATH/TO/WORKING_DIRECTORY>")
+
+# Your existing Swiss-Prot-annotated DMR CSV files
+comparisons <- tibble(
+  comparison = c(
+    "high_vs_control",
+    "low_vs_control",
+    "high_vs_low"
+  ),
+
+  dmr_file = c(
+    "high_vs_control/DMRs_with_gene_symbols_high_vs_control_pfg.csv",
+    "low_vs_control/DMRs_with_gene_symbols_low_vs_control_pfg.csv",
+    "high_vs_low/DMRs_with_gene_symbols_high_vs_low_pfg.csv"
+  ),
+  dmr_output_file = c(
+    "high_vs_control/DMRs_atl_blastp_high_vs_control_pfg.csv",
+    "low_vs_control/DMRs_atl_blastp_low_vs_control_pfg.csv",
+    "high_vs_low/DMRs_atl_blastp_high_vs_low_pfg.csv"
+  ),
+  output_prefix = c(
+    "high_vs_control",
+    "low_vs_control",
+    "high_vs_low"
+  )
+)
+
+# Your full polar cod predicted-protein FASTA
+polar_cod_proteins_faa <- "<PATH/TO/GCA_964260565.1_borsaiasm_protein.faa>"
+
+# Directory for Atlantic cod BLAST files and results
+atlantic_cod_dir <- "atl_blastp_pfg"
+
+# Number of threads for BLASTP
+n_threads <- 16
+
+# Atlantic cod RefSeq protein FASTA
+# gadMor3.0 / GCF_902167405.1
+
+atlantic_cod_fasta_url <- "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/902/167/405/GCF_902167405.1_gadMor3.0/GCF_902167405.1_gadMor3.0_protein.faa.gz"
+
+# Quality thresholds for calling an Atlantic cod hit usable
+min_atl_pident <- 40
+min_atl_query_coverage <- 70
+max_atl_evalue <- 1e-10
+
+# BLAST+ must be available on PATH (load the module in the sbatch script:
+# module load BLAST+/2.17.0-gompi-2025b)
+
+###############################################################################
+
+dir.create(atlantic_cod_dir, showWarnings = FALSE)
+
+atlantic_cod_fasta <- file.path(
+  atlantic_cod_dir,
+  "atlantic_cod_proteins.faa"
+)
+
+atlantic_cod_db <- file.path(
+  atlantic_cod_dir,
+  "atlantic_cod_db"
+)
+
+###############################################################################
+# 2. Download Atlantic cod RefSeq proteins if needed
+###############################################################################
+
+if (!file.exists(atlantic_cod_fasta)) {
+  
+  message("Downloading Atlantic cod RefSeq protein FASTA...")
+  
+  gz_file <- file.path(atlantic_cod_dir, "atlantic_cod_proteins.faa.gz")
+  
+  download.file(
+    url = atlantic_cod_fasta_url,
+    destfile = gz_file,
+    mode = "wb"
+  )
+  
+  # Decompress .gz file
+  R.utils::gunzip(gz_file, destname = atlantic_cod_fasta, remove = TRUE)
+  
+  message("Atlantic cod protein FASTA saved to: ", atlantic_cod_fasta)
+}
+
+###############################################################################
+# 3. Create Atlantic cod BLASTP database if needed
+###############################################################################
+
+if (!file.exists(paste0(atlantic_cod_db, ".pin"))) {
+  
+  message("Creating Atlantic cod BLASTP database...")
+  
+  system2(
+    command = "makeblastdb",
+    args = c(
+      "-in", atlantic_cod_fasta,
+      "-dbtype", "prot",
+      "-parse_seqids",
+      "-out", atlantic_cod_db
+    )
+  )
+  
+  message("Atlantic cod BLAST database created: ", atlantic_cod_db)
+}
+
+###############################################################################
+# 4. Functions
+###############################################################################
+
+# Read a DMR CSV; handles comma- or tab-delimited files
+read_dmr_table <- function(file) {
+  
+  message("Reading: ", file)
+  
+  tbl <- read_delim(
+    file,
+    delim = ",",
+    show_col_types = FALSE,
+    na = c("", "NA", "NaN")
+  )
+  
+  # If comma-delimited reading produced only one column,
+  # try tab-delimited reading.
+  if (ncol(tbl) == 1) {
+    tbl <- read_delim(
+      file,
+      delim = "\t",
+      show_col_types = FALSE,
+      na = c("", "NA", "NaN")
+    )
+  }
+  
+  required_columns <- c(
+    "seqnames",
+    "start",
+    "end",
+    "dmr_id",
+    "protein_id",
+    "sseqid"
+  )
+  
+  missing_columns <- setdiff(required_columns, colnames(tbl))
+  
+  if (length(missing_columns) > 0) {
+    stop(
+      "Missing required columns in ", file, ": ",
+      paste(missing_columns, collapse = ", ")
+    )
+  }
+  
+  tbl
+}
+
+# Select DMRs with no Swiss-Prot hit
+select_dmrs_without_swissprot <- function(tbl) {
+  
+  tbl %>%
+    mutate(
+      seqnames = as.character(seqnames),
+      start = as.integer(start),
+      end = as.integer(end),
+      protein_id = as.character(protein_id),
+      sseqid = as.character(sseqid),
+      
+      no_swissprot_hit =
+        is.na(sseqid) |
+        sseqid == "" |
+        sseqid == "NA",
+      
+      valid_coordinates =
+        !is.na(seqnames) &
+        !is.na(start) &
+        !is.na(end) &
+        start >= 1 &
+        end >= start,
+      
+      valid_protein_id =
+        !is.na(protein_id) &
+        protein_id != "" &
+        protein_id != "NA"
+    ) %>%
+    filter(
+      valid_coordinates,
+      valid_protein_id,
+      no_swissprot_hit
+    )
+}
+
+# Extract selected protein sequences from a FASTA file
+extract_proteins_from_fasta <- function(
+    fasta_file,
+    protein_ids,
+    output_fasta
+) {
+  
+  message("Extracting ", length(protein_ids), " protein sequences from FASTA...")
+  
+  fasta_lines <- readLines(fasta_file)
+  
+  header_positions <- which(str_detect(fasta_lines, "^>"))
+  
+  if (length(header_positions) == 0) {
+    stop("No FASTA headers found in: ", fasta_file)
+  }
+  
+  sequence_start <- header_positions + 1
+  sequence_end <- c(
+    header_positions[-1] - 1,
+    length(fasta_lines)
+  )
+  
+  fasta_ids <- str_remove(fasta_lines[header_positions], "^>") %>%
+    str_extract("^\\S+")
+  
+  selected_positions <- which(fasta_ids %in% protein_ids)
+  
+  if (length(selected_positions) == 0) {
+    stop(
+      "None of the selected protein IDs were found in the polar cod FASTA.\n",
+      "Check that protein_id values match the FASTA headers."
+    )
+  }
+  
+  output_lines <- unlist(
+    lapply(
+      selected_positions,
+      function(i) {
+        c(
+          fasta_lines[header_positions[i]],
+          fasta_lines[sequence_start[i]:sequence_end[i]]
+        )
+      }
+    )
+  )
+  
+  writeLines(output_lines, output_fasta)
+  
+  message(
+    "Extracted ", length(selected_positions),
+    " proteins to: ", output_fasta
+  )
+  
+  invisible(output_fasta)
+}
+
+# Run BLASTP
+run_atlantic_cod_blastp <- function(
+    query_fasta,
+    output_tsv,
+    n_threads = 16
+) {
+  
+  message("Running BLASTP against Atlantic cod RefSeq proteins...")
+  
+  # Build a single command string: system2() mis-quotes the multi-word
+  # -outfmt value on this system, causing blastp to reject it.
+  outfmt_spec <- "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen qcovs stitle"
+  
+  blast_cmd <- paste(
+    "blastp",
+    "-query", shQuote(query_fasta),
+    "-db", shQuote(atlantic_cod_db),
+    "-out", shQuote(output_tsv),
+    "-outfmt", shQuote(outfmt_spec),
+    "-evalue", "1e-5",
+    "-max_target_seqs", "5",
+    "-num_threads", as.character(n_threads)
+  )
+  
+  exit_status <- system(blast_cmd)
+  
+  if (exit_status != 0) {
+    stop("blastp failed with exit status ", exit_status,
+         " for query: ", query_fasta)
+  }
+  
+  message("BLASTP results written to: ", output_tsv)
+  
+  invisible(output_tsv)
+}
+
+# Read and summarise BLASTP results
+read_atlantic_cod_blastp_results <- function(blast_file) {
+  
+  blast_columns <- c(
+    "protein_id",
+    "blast_atl_sseqid",
+    "blast_atl_pident",
+    "blast_atl_alignment_length",
+    "blast_atl_mismatch",
+    "blast_atl_gapopen",
+    "blast_atl_qstart",
+    "blast_atl_qend",
+    "blast_atl_sstart",
+    "blast_atl_send",
+    "blast_atl_evalue",
+    "blast_atl_bitscore",
+    "blast_atl_qlen",
+    "blast_atl_slen",
+    "blast_atl_query_coverage",
+    "blast_atl_stitle"
+  )
+  
+  if (!file.exists(blast_file) || file.info(blast_file)$size == 0) {
+    message("No BLASTP hits found in: ", blast_file)
+    return(tibble())
+  }
+  
+  read_tsv(
+    blast_file,
+    col_names = blast_columns,
+    show_col_types = FALSE
+  ) %>%
+    mutate(
+      blast_atl_pident = as.numeric(blast_atl_pident),
+      blast_atl_evalue = as.numeric(blast_atl_evalue),
+      blast_atl_bitscore = as.numeric(blast_atl_bitscore),
+      blast_atl_query_coverage = as.numeric(blast_atl_query_coverage),
+      
+      blast_atl_protein_name = str_trim(
+        str_remove(
+          blast_atl_stitle,
+          "\\s*\\[Gadus morhua\\]\\s*$"
+        )
+      ),
+      
+      blast_atl_annotation_quality = case_when(
+        blast_atl_pident >= min_atl_pident &
+          blast_atl_query_coverage >= min_atl_query_coverage &
+          blast_atl_evalue <= max_atl_evalue ~
+          "usable_atlantic_cod_hit",
+        
+        TRUE ~ "weak_atlantic_cod_hit"
+      ),
+      
+      blast_atl_gene_label = case_when(
+        blast_atl_annotation_quality == "usable_atlantic_cod_hit" ~
+          blast_atl_protein_name,
+        
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    group_by(protein_id) %>%
+    arrange(blast_atl_evalue, desc(blast_atl_bitscore)) %>%
+    slice(1) %>%
+    ungroup()
+}
+
+###############################################################################
+# 5. Process each comparison
+###############################################################################
+
+input_csv_files <- comparisons$dmr_file
+
+for (input_csv in input_csv_files) {
+  
+  message("\n=============================================================")
+  message("Processing: ", input_csv)
+  message("=============================================================")
+  
+  # Read original Swiss-Prot annotated DMR table
+  dmr_table <- read_dmr_table(input_csv)
+  
+  # Select DMRs without Swiss-Prot hits
+  dmrs_no_swissprot <- select_dmrs_without_swissprot(dmr_table)
+  
+  n_selected_proteins <- n_distinct(dmrs_no_swissprot$protein_id)
+  
+  message(
+    "DMRs without Swiss-Prot hits: ", nrow(dmrs_no_swissprot),
+    "\nUnique polar cod proteins to search: ", n_selected_proteins
+  )
+  
+  if (n_selected_proteins == 0) {
+    message("No proteins to BLAST. Skipping this comparison.\n")
+    next
+  }
+  
+  # Create comparison-specific file names
+  comparison_name <- tools::file_path_sans_ext(basename(input_csv))
+  
+  query_fasta <- file.path(
+    atlantic_cod_dir,
+    paste0(comparison_name, "_unnamed_polar_cod_proteins.faa")
+  )
+  
+  blast_tsv <- file.path(
+    atlantic_cod_dir,
+    paste0(comparison_name, "_polar_cod_vs_atlantic_cod_blastp.tsv")
+  )
+  
+  output_csv <- file.path(
+    dirname(input_csv),
+    paste0(
+      tools::file_path_sans_ext(basename(input_csv)),
+      "_with_atlantic_cod.csv"
+    )
+  )
+  
+  # Extract only the proteins that need Atlantic cod BLASTP
+  protein_ids_to_search <- dmrs_no_swissprot %>%
+    distinct(protein_id) %>%
+    pull(protein_id)
+  
+  extract_proteins_from_fasta(
+    fasta_file = polar_cod_proteins_faa,
+    protein_ids = protein_ids_to_search,
+    output_fasta = query_fasta
+  )
+  
+  # Run BLASTP
+  run_atlantic_cod_blastp(
+    query_fasta = query_fasta,
+    output_tsv = blast_tsv,
+    n_threads = n_threads
+  )
+  
+  # Read best Atlantic cod hit per polar cod protein
+  atl_results <- read_atlantic_cod_blastp_results(blast_tsv)
+  
+  # Merge Atlantic cod results back into the full original DMR table
+  if (nrow(atl_results) > 0) {
+    
+    dmr_with_atl <- dmr_table %>%
+      mutate(protein_id = as.character(protein_id)) %>%
+      left_join(
+        atl_results,
+        by = "protein_id"
+      ) %>%
+      mutate(
+        blast_atl_annotation_quality = replace_na(
+          blast_atl_annotation_quality,
+          "no_atlantic_cod_hit"
+        )
+      )
+    
+  } else {
+    
+    dmr_with_atl <- dmr_table %>%
+      mutate(
+        blast_atl_sseqid = NA_character_,
+        blast_atl_pident = NA_real_,
+        blast_atl_alignment_length = NA_integer_,
+        blast_atl_evalue = NA_real_,
+        blast_atl_bitscore = NA_real_,
+        blast_atl_qlen = NA_integer_,
+        blast_atl_slen = NA_integer_,
+        blast_atl_query_coverage = NA_real_,
+        blast_atl_stitle = NA_character_,
+        blast_atl_protein_name = NA_character_,
+        blast_atl_annotation_quality = "no_atlantic_cod_hit",
+        blast_atl_gene_label = NA_character_
+      )
+  }
+  
+  # Summary
+  summary_table <- dmr_with_atl %>%
+    count(blast_atl_annotation_quality)
+  
+  message("\nAtlantic cod BLASTP summary for ", comparison_name, ":")
+  print(summary_table)
+  
+  # Write final CSV
+  fwrite(dmr_with_atl, output_csv)
+  
+  message("Wrote output CSV: ", output_csv)
+  message(
+    "DMRs with usable Atlantic cod hit: ",
+    sum(
+      dmr_with_atl$blast_atl_annotation_quality == "usable_atlantic_cod_hit",
+      na.rm = TRUE
+    )
+  )
+}
+
+message("\nAll comparisons processed.")

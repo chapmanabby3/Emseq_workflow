@@ -86,21 +86,24 @@ Gene symbols and functional descriptions
             v
 Unresolved loci
             |
-            +--> DNA sequence extraction → blastn
+BLASTP against Atlantic cod reference
             |
-            +--> Protein sequence/homolog → tblastn
+Unresolved loci
             |
-            +--> No convincing coding model → ncRNA search
+            v
+eggNOG ortholog mapper
+            |
+            v
+Unresolved loci
+            |
+            v
+Search sequences against Rfam with Infernal
 
-            OR Current Draft Option:
+....................................................
             Right now I am running (after swissp):
-            -blastp to atlantic cod reference
-            -eggNOG mapper
-            -GO & KEGG
             1. atl_blastp_pfg.R
             2. prep_eggNOG_quer_pfg.R (submit with run_eggN_quer_prep_pfg.sh)
             3. run_eggNOG_pfg.sh
             4. merge_eggNOG_pfg.R
             5. ncRNA_pfg.sh
             6. merge_rfam_pfg.R
-            4. (Must blast all DMRs against atl cod prior to GO & KEGG steps)
